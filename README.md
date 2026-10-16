@@ -14,4 +14,4 @@ This repository will contain the code and resources for the AIORI-3 hackathon th
 **Proposed Solution:** NIRIKSHA — “Discover. Examine. Verify.”
 
 ▶️ **YouTube Video:**  
-https://youtu.be/PeDULdJhSoI
+https://youtu.be/j814kD0HllM
