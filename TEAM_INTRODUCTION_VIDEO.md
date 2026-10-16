@@ -7,6 +7,6 @@
 
 ## YouTube Video
 
-https://youtu.be/PeDULdJhSoI
+https://youtu.be/j814kD0HllM
 
 This video presents the team's understanding of the problem statement, the proposed solution, and the assigned roles of all team members as required for the AIORI-3 initial orientation.
