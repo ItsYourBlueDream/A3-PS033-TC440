@@ -24,9 +24,9 @@
 *This video presents the team's understanding of the problem statement, the proposed solution architecture, and the assigned roles of all team members as required for the AIORI-3 orientation.*
 
 ### Repository Documentation References
-* **Technical Presentation Slides:** [NIRIKSHA_AIORI3_Presentation_A3-PS033-TC440.pdf](file:///d:/aiori/A3-PS033-TC440/NIRIKSHA_AIORI3_Presentation_A3-PS033-TC440.pdf)
-* **Team Video Submission File:** [TEAM_INTRODUCTION_VIDEO.md](file:///d:/aiori/A3-PS033-TC440/TEAM_INTRODUCTION_VIDEO.md)
-* **AIORI Hackathon Structure Reference:** [Proposed-structure-hackathon.pdf](file:///d:/aiori/A3-PS033-TC440/Proposed-structure-hackathon.pdf)
+* **Technical Presentation Slides:** [NIRIKSHA_AIORI3_Presentation_A3-PS033-TC440.pdf](NIRIKSHA_AIORI3_Presentation_A3-PS033-TC440.pdf)
+* **Team Video Submission File:** [TEAM_INTRODUCTION_VIDEO.md](TEAM_INTRODUCTION_VIDEO.md)
+* **AIORI Hackathon Structure Reference:** [Proposed-structure-hackathon.pdf](Proposed-structure-hackathon.pdf)
 
 ---
 
@@ -477,4 +477,5 @@ In accordance with hackathon guidelines, NIRIKSHA states its technical boundarie
 * **Official Team Orientation Video:** [https://youtu.be/j814kD0HllM](https://youtu.be/j814kD0HllM)
 * **Code Repository:** `https://github.com/aiori-hackathon/A3-PS033-TC440.git`
 * **Baseline Commit:** `87e2435`
+
 
