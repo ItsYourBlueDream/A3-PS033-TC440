@@ -1,27 +1,32 @@
 """
 NIRIKSHA - DNS-SD Evidence-Based Verification Platform
-Phase 2A: Continuous monitor + JSONL event logger
+Phase 2A + 2B: Continuous monitor + JSONL event logger + Endpoint Migration
 
 Architecture:
   - ServiceBrowser (zeroconf thread) populates a thread-safe registry of
-    known ServiceRecords.
+    known ServiceRecords and notifies the monitor via wake_event.
   - A polling loop (main thread) calls verifier.verify_once() at configurable
-    intervals and drives the per-service state machine.
-  - State transitions are emitted as structured JSONL events to a log file
-    AND to stdout.
+    intervals or immediately upon mDNS endpoint updates.
+  - State transitions, discovery events, and endpoint migrations are emitted
+    as structured JSONL events to a log file AND to stdout.
 
 State transitions tracked:
-  UNKNOWN  -> any state  (first contact)
-  VERIFIED -> DEGRADED   (capability drift or health regression)
+  UNKNOWN  -> any state   (first contact)
+  VERIFIED -> DEGRADED    (capability drift or health regression)
   VERIFIED -> UNREACHABLE (HTTP endpoint died, ad still live)
-  any      -> STALE      (mDNS advertisement withdrawn)
-  UNREACHABLE -> VERIFIED (recovery)
-  DEGRADED    -> VERIFIED (recovery)
+  any      -> STALE       (mDNS advertisement withdrawn)
+  UNREACHABLE -> VERIFIED (recovery / replacement verification)
+  DEGRADED    -> VERIFIED (recovery / replacement verification)
+  STALE       -> VERIFIED (re-advertised / replacement verification)
 
-Failure-detection latency is measured from the last VERIFIED observation
-to the first UNREACHABLE/DEGRADED observation using the monotonic clock.
-Because the actual fault instant is unknown (it happened between polls),
-we label it "estimated_detection_latency_ms" in the event.
+Migration & Timing Metrics:
+  - rediscovery_latency_ms: Monotonic time from fault detection to discovery
+    of the replacement endpoint via mDNS.
+  - verification_latency_ms: Monotonic duration of the verification probe.
+  - recovery_latency_ms: Monotonic time from fault detection to successful
+    VERIFIED state at the replacement endpoint.
+  - estimated_total_recovery_latency_ms: Monotonic time from last known good
+    verification to successful VERIFIED state at the replacement endpoint.
 """
 
 from __future__ import annotations
@@ -70,10 +75,20 @@ class _ServiceRegistry:
         self._records: dict[str, ServiceRecord] = {}  # instance_name -> record
         self._stale:   dict[str, ServiceRecord] = {}  # instance_name -> removed record
 
-    def add(self, record: ServiceRecord) -> None:
+    def add(self, record: ServiceRecord) -> bool:
+        """Add or update record. Returns True if this is a new or changed record."""
         with self._lock:
             self._stale.pop(record.instance_name, None)
+            old = self._records.get(record.instance_name)
+            is_changed = (
+                old is None
+                or old.port != record.port
+                or old.addresses != record.addresses
+                or old.txt != record.txt
+                or old.host != record.host
+            )
             self._records[record.instance_name] = record
+            return is_changed
 
     def remove(self, instance_name: str) -> Optional[ServiceRecord]:
         """Mark *instance_name* as stale; return the removed record or None."""
@@ -111,22 +126,32 @@ def _decode_txt(properties: dict) -> dict[str, str]:
 class _MonitorListener(ServiceListener):
     """Populates registry from live mDNS events."""
 
-    def __init__(self, zc: Zeroconf, registry: _ServiceRegistry) -> None:
+    def __init__(
+        self,
+        zc: Zeroconf,
+        registry: _ServiceRegistry,
+        logger: Optional[EventLogger] = None,
+        wake_event: Optional[threading.Event] = None,
+    ) -> None:
         self._zc = zc
         self._registry = registry
+        self._logger = logger
+        self._wake_event = wake_event
 
     def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        self._resolve(zc, type_, name)
+        self._resolve(zc, type_, name, action="add")
 
     def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
-        self._resolve(zc, type_, name)
+        self._resolve(zc, type_, name, action="update")
 
     def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         removed = self._registry.remove(name)
         if removed:
             print(f"[MONITOR] mDNS: advertisement withdrawn for {name}", flush=True)
+            if self._wake_event:
+                self._wake_event.set()
 
-    def _resolve(self, zc: Zeroconf, type_: str, name: str) -> None:
+    def _resolve(self, zc: Zeroconf, type_: str, name: str, action: str = "add") -> None:
         info: Optional[ServiceInfo] = zc.get_service_info(type_, name, timeout=5000)
         if info is None:
             print(f"[MONITOR] Could not resolve ServiceInfo for {name}", flush=True)
@@ -141,12 +166,17 @@ class _MonitorListener(ServiceListener):
             addresses=addresses,
             txt=txt,
         )
-        self._registry.add(record)
+        changed = self._registry.add(record)
+        if self._logger:
+            self._logger.discovery(record, action=action)
+
         print(
-            f"[MONITOR] mDNS: registered {name} "
+            f"[MONITOR] mDNS: {action.upper()} {name} "
             f"at {addresses[0] if addresses else '?'}:{info.port}",
             flush=True,
         )
+        if changed and self._wake_event:
+            self._wake_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -168,11 +198,66 @@ class EventLogger:
                 fh.write(line + "\n")
         print(f"[EVENT] {line}", flush=True)
 
+    def discovery(self, record: ServiceRecord, action: str = "add") -> None:
+        """Emit an event when mDNS announces an addition or update."""
+        self.emit({
+            "event": "discovery",
+            "action": action,
+            "wall_clock_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "service": {
+                "instance_name": record.instance_name,
+                "host": record.host,
+                "port": record.port,
+                "addresses": record.addresses,
+                "txt": record.txt,
+            },
+        })
+
+    def endpoint_migration(
+        self,
+        record: ServiceRecord,
+        old_endpoint: dict,
+        new_endpoint: dict,
+        rediscovery_latency_ms: Optional[float] = None,
+        estimated_rediscovery_latency_ms: Optional[float] = None,
+    ) -> None:
+        """Emit an event when an existing service changes its advertised port or address."""
+        payload: dict = {
+            "event": "endpoint_migration",
+            "wall_clock_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "service": {
+                "instance_name": record.instance_name,
+                "host": record.host,
+                "port": record.port,
+                "addresses": record.addresses,
+                "txt": record.txt,
+            },
+            "old_endpoint": old_endpoint,
+            "new_endpoint": new_endpoint,
+            "reason": (
+                f"Advertised endpoint migrated from port {old_endpoint.get('port')} "
+                f"to port {new_endpoint.get('port')}"
+            ),
+        }
+        if rediscovery_latency_ms is not None:
+            payload["rediscovery_latency_ms"] = rediscovery_latency_ms
+        if estimated_rediscovery_latency_ms is not None:
+            payload["estimated_rediscovery_latency_ms"] = estimated_rediscovery_latency_ms
+        self.emit(payload)
+
     def state_change(
         self,
         result: VerificationResult,
         old_state: ServiceState,
-        last_verified_mono: Optional[float],
+        last_verified_mono: Optional[float] = None,
+        fault_detected_mono: Optional[float] = None,
+        is_recovery: bool = False,
+        is_migration: bool = False,
+        old_endpoint: Optional[dict] = None,
+        new_endpoint: Optional[dict] = None,
+        recovery_latency_ms: Optional[float] = None,
+        estimated_total_recovery_latency_ms: Optional[float] = None,
+        rediscovery_latency_ms: Optional[float] = None,
     ) -> None:
         """Emit a state-transition event with all relevant measurement fields."""
         record = result.record
@@ -188,8 +273,8 @@ class EventLogger:
                 "addresses": record.addresses,
                 "txt": record.txt,
             },
-            "old_state": old_state.value,
-            "new_state": new_state.value,
+            "old_state": old_state.value if isinstance(old_state, ServiceState) else str(old_state),
+            "new_state": new_state.value if isinstance(new_state, ServiceState) else str(new_state),
             "reason": result.reason,
             "measurements": {
                 "http_status": result.http_status,
@@ -210,6 +295,23 @@ class EventLogger:
             event["estimated_detection_latency_ms"] = round(
                 (result.started_at_mono - last_verified_mono) * 1000, 2
             )
+
+        # Recovery & Migration measurement fields
+        if is_recovery:
+            event["is_recovery"] = True
+            if recovery_latency_ms is not None:
+                event["recovery_latency_ms"] = recovery_latency_ms
+            if estimated_total_recovery_latency_ms is not None:
+                event["estimated_total_recovery_latency_ms"] = estimated_total_recovery_latency_ms
+
+        if is_migration:
+            event["is_migration"] = True
+            if old_endpoint:
+                event["old_endpoint"] = old_endpoint
+            if new_endpoint:
+                event["new_endpoint"] = new_endpoint
+            if rediscovery_latency_ms is not None:
+                event["rediscovery_latency_ms"] = rediscovery_latency_ms
 
         self.emit(event)
 
@@ -237,7 +339,7 @@ class EventLogger:
         self.emit({
             "event": "probe",
             "wall_clock_utc": result.wall_clock_utc,
-            "service": {"instance_name": record.instance_name},
+            "service": {"instance_name": record.instance_name, "port": record.port},
             "state": result.state.value,
             "reason": result.reason,
             "measurements": {
@@ -253,23 +355,122 @@ class EventLogger:
 # ---------------------------------------------------------------------------
 
 class _ServiceFSM:
-    """Tracks state for one discovered service instance."""
+    """Tracks state and migration lifecycle for one discovered service instance."""
 
     def __init__(self) -> None:
         self.state: ServiceState = ServiceState.UNKNOWN
-        self.last_verified_mono: Optional[float] = None   # monotonic at last VERIFIED
+        self.last_verified_mono: Optional[float] = None         # monotonic at last VERIFIED
+        self.fault_detected_mono: Optional[float] = None        # monotonic when failure was first detected
+        self.current_endpoint: Optional[tuple[str, int]] = None   # (host/ip, port)
+        self.last_record: Optional[ServiceRecord] = None
+        self.migration_in_progress: bool = False
+        self.old_endpoint_info: Optional[dict] = None
+        self.migration_discovered_mono: Optional[float] = None
 
     def update(self, result: VerificationResult, logger: EventLogger) -> None:
-        new_state = result.state
-        if new_state == ServiceState.VERIFIED:
-            self.last_verified_mono = result.finished_at_mono
+        record = result.record
+        new_endpoint = (record.primary_ip or record.host, record.port)
 
-        if new_state != self.state:
-            logger.state_change(result, self.state, self.last_verified_mono)
+        # 1. Detect endpoint migration
+        if self.current_endpoint is not None and new_endpoint != self.current_endpoint:
+            self.migration_in_progress = True
+            self.migration_discovered_mono = record.discovered_at
+            self.old_endpoint_info = {
+                "host": self.last_record.host if self.last_record else "",
+                "port": self.current_endpoint[1],
+                "addresses": self.last_record.addresses if self.last_record else [],
+            }
+            new_endpoint_info = {
+                "host": record.host,
+                "port": record.port,
+                "addresses": record.addresses,
+            }
+
+            rediscovery_latency_ms: Optional[float] = None
+            estimated_rediscovery_latency_ms: Optional[float] = None
+            if self.fault_detected_mono is not None:
+                rediscovery_latency_ms = round(
+                    max(0.0, (record.discovered_at - self.fault_detected_mono) * 1000), 2
+                )
+            if self.last_verified_mono is not None:
+                estimated_rediscovery_latency_ms = round(
+                    max(0.0, (record.discovered_at - self.last_verified_mono) * 1000), 2
+                )
+
+            logger.endpoint_migration(
+                record=record,
+                old_endpoint=self.old_endpoint_info,
+                new_endpoint=new_endpoint_info,
+                rediscovery_latency_ms=rediscovery_latency_ms,
+                estimated_rediscovery_latency_ms=estimated_rediscovery_latency_ms,
+            )
+            self.current_endpoint = new_endpoint
+        elif self.current_endpoint is None:
+            self.current_endpoint = new_endpoint
+
+        new_state = result.state
+
+        # 2. Track failure onset timestamp
+        if new_state in (ServiceState.UNREACHABLE, ServiceState.DEGRADED):
+            if self.fault_detected_mono is None:
+                self.fault_detected_mono = result.started_at_mono
+
+        # 3. Compute recovery and migration measurements
+        is_recovery = False
+        recovery_latency_ms: Optional[float] = None
+        estimated_total_recovery_latency_ms: Optional[float] = None
+        rediscovery_latency_ms_final: Optional[float] = None
+
+        if new_state == ServiceState.VERIFIED:
+            if self.state in (ServiceState.UNREACHABLE, ServiceState.DEGRADED, ServiceState.STALE) or self.migration_in_progress:
+                is_recovery = True
+                if self.fault_detected_mono is not None:
+                    recovery_latency_ms = round(
+                        max(0.0, (result.finished_at_mono - self.fault_detected_mono) * 1000), 2
+                    )
+                if self.last_verified_mono is not None:
+                    estimated_total_recovery_latency_ms = round(
+                        max(0.0, (result.finished_at_mono - self.last_verified_mono) * 1000), 2
+                    )
+                if self.migration_discovered_mono is not None and self.fault_detected_mono is not None:
+                    rediscovery_latency_ms_final = round(
+                        max(0.0, (self.migration_discovered_mono - self.fault_detected_mono) * 1000), 2
+                    )
+
+        state_changed = (new_state != self.state)
+        was_migrating = self.migration_in_progress
+        saved_old_endpoint = self.old_endpoint_info
+
+        if state_changed or was_migrating:
+            logger.state_change(
+                result=result,
+                old_state=self.state,
+                last_verified_mono=self.last_verified_mono,
+                fault_detected_mono=self.fault_detected_mono,
+                is_recovery=is_recovery,
+                is_migration=was_migrating,
+                old_endpoint=saved_old_endpoint,
+                new_endpoint={
+                    "host": record.host,
+                    "port": record.port,
+                    "addresses": record.addresses,
+                } if was_migrating else None,
+                recovery_latency_ms=recovery_latency_ms,
+                estimated_total_recovery_latency_ms=estimated_total_recovery_latency_ms,
+                rediscovery_latency_ms=rediscovery_latency_ms_final,
+            )
             self.state = new_state
         else:
-            # No state change; emit a routine probe event (verbose mode)
             logger.probe(result)
+
+        if new_state == ServiceState.VERIFIED:
+            self.last_verified_mono = result.finished_at_mono
+            self.fault_detected_mono = None
+            self.migration_in_progress = False
+            self.old_endpoint_info = None
+            self.migration_discovered_mono = None
+
+        self.last_record = record
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +479,10 @@ class _ServiceFSM:
 
 class Monitor:
     """
-    Continuous verification monitor.
+    Continuous verification monitor with automatic endpoint migration rediscovery.
 
-    Discovers services via mDNS, verifies them on every poll tick, drives
-    state machines, and emits structured JSONL events.
+    Discovers services via mDNS, verifies them on every poll tick, detects
+    endpoint migration, drives state machines, and emits structured JSONL events.
     """
 
     def __init__(
@@ -298,6 +499,7 @@ class Monitor:
         self._registry = _ServiceRegistry()
         self._fsm_map: dict[str, _ServiceFSM] = {}   # instance_name -> FSM
         self._stop = threading.Event()
+        self._wake_event = threading.Event()
 
     def run(self) -> None:
         """Start browsing and polling. Blocks until stop() is called or KeyboardInterrupt."""
@@ -309,14 +511,21 @@ class Monitor:
         )
 
         zc = Zeroconf()
-        listener = _MonitorListener(zc, self._registry)
+        listener = _MonitorListener(
+            zc,
+            self._registry,
+            logger=self._logger,
+            wake_event=self._wake_event,
+        )
         browser = ServiceBrowser(zc, SERVICE_TYPE, listener)
 
         print(
             f"[MONITOR] Waiting up to {self._discovery_timeout}s for initial discovery ...",
             flush=True,
         )
-        time.sleep(self._discovery_timeout)
+        # Wait for discovery or stop
+        self._wake_event.wait(timeout=self._discovery_timeout)
+        self._wake_event.clear()
 
         try:
             self._poll_loop()
@@ -329,13 +538,15 @@ class Monitor:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake_event.set()
 
     def _poll_loop(self) -> None:
         print("[MONITOR] Entering poll loop ...", flush=True)
         while not self._stop.is_set():
             self._tick()
             self._handle_stale()
-            self._stop.wait(timeout=self._interval)
+            self._wake_event.wait(timeout=self._interval)
+            self._wake_event.clear()
 
     def _tick(self) -> None:
         records = self._registry.all_records()
@@ -365,8 +576,11 @@ class Monitor:
 
     def _handle_stale(self) -> None:
         for stale in self._registry.pop_stale():
-            fsm = self._fsm_map.pop(stale.instance_name, None)
+            # Retain FSM in _fsm_map so prior endpoint and fault timing survive re-advertisement
+            fsm = self._fsm_map.get(stale.instance_name)
             old_state = fsm.state.value if fsm else "ACTIVE"
             self._logger.stale(stale, old_state=old_state)
             if fsm:
                 fsm.state = ServiceState.STALE
+                if fsm.fault_detected_mono is None:
+                    fsm.fault_detected_mono = time.monotonic()

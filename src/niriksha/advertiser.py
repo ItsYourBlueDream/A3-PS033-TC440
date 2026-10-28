@@ -1,16 +1,22 @@
 """
 NIRIKSHA - DNS-SD Evidence-Based Verification Platform
-Phase 1 + 2A: DNS-SD Advertiser
+Phase 1 + 2A + 2B: DNS-SD Advertiser
 
 Registers the NIRIKSHA diagnostic service via mDNS/DNS-SD using python-zeroconf.
 Service type : _niriksha._tcp.local.
 Default port : 8001
 
-Phase 2A fault-injection CLI flags (do NOT affect Phase 1 defaults):
+Phase 2A fault-injection CLI flags:
   --inject-port PORT   Advertise a wrong SRV port (service still listens on 8001).
   --inject-diag VALUE  Advertise a wrong TXT diag value (e.g. "http" instead of "dns").
 
-These flags are for controlled failure demonstrations only.
+Phase 2B endpoint migration CLI flags:
+  --migrate-to PORT    After a delay, migrate advertised endpoint to this new port.
+  --migrate-delay SEC  Seconds to wait before migrating (default: 10.0).
+  --migrate-mode MODE  Migration strategy: 'update' (in-place SRV update) or
+                       're-register' (unregister old, register new). Default: update.
+
+These flags are for controlled demonstrations only. Defaults preserve Phase 1 behavior.
 Selects an active, non-loopback IPv4 address automatically from the OS.
 """
 
@@ -57,7 +63,7 @@ def _build_service_info(
     full_name = f"{INSTANCE_NAME}.{SERVICE_TYPE}"
 
     properties = {
-        "diag":    inject_diag if inject_diag is not None else "dns_lookup",
+        "diag":    inject_diag if inject_diag is not None else "dns",
         "txtvers": "1",
         "health":  "/health",
         "run":     "/diagnose",
@@ -77,12 +83,16 @@ def advertise(
     port: int = DEFAULT_PORT,
     inject_port: int | None = None,
     inject_diag: str | None = None,
+    migrate_to: int | None = None,
+    migrate_delay: float = 10.0,
+    migrate_mode: str = "update",
 ) -> None:
     """
     Register the service and block until SIGINT / SIGTERM.
 
     inject_port: advertise this port instead of the real one (fault scenario B/C).
     inject_diag: advertise this TXT diag value instead of 'dns' (fault scenario D).
+    migrate_to:  after migrate_delay, migrate advertised port to this value (Phase 2B).
     """
     ip = _get_local_ipv4()
     advertised_port = inject_port if inject_port is not None else port
@@ -103,6 +113,12 @@ def advertise(
     if inject_diag is not None:
         print(f"  [INJECTED diag='{inject_diag}']", end="")
     print()
+    if migrate_to is not None:
+        print(
+            f"  [MIGRATION SCHEDULED] Will migrate to port {migrate_to} "
+            f"in {migrate_delay}s (mode: {migrate_mode})",
+            flush=True,
+        )
     print("[ADVERTISER] Advertising ... Press Ctrl-C to stop.\n", flush=True)
 
     stop_flag = [False]
@@ -113,9 +129,32 @@ def advertise(
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    migrated = False
+    start_mono = time.monotonic()
+
     try:
         while not stop_flag[0]:
             time.sleep(0.5)
+            if migrate_to is not None and not migrated:
+                if (time.monotonic() - start_mono) >= migrate_delay:
+                    print(
+                        f"\n[ADVERTISER] Migrating service to port {migrate_to} "
+                        f"(mode: {migrate_mode}) ...",
+                        flush=True,
+                    )
+                    new_info = _build_service_info(migrate_to, ip, inject_diag=inject_diag)
+                    if migrate_mode == "update":
+                        zc.update_service(new_info)
+                    else:
+                        zc.unregister_service(info)
+                        time.sleep(0.5)
+                        zc.register_service(new_info)
+                    info = new_info
+                    migrated = True
+                    print(
+                        f"[ADVERTISER] Migration complete! Now advertising on port {migrate_to}.\n",
+                        flush=True,
+                    )
     finally:
         print("\n[ADVERTISER] Unregistering service ...", flush=True)
         zc.unregister_service(info)
@@ -125,7 +164,7 @@ def advertise(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="NIRIKSHA DNS-SD Advertiser (Phase 1 + 2A)"
+        description="NIRIKSHA DNS-SD Advertiser (Phase 1 + 2A + 2B)"
     )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT,
@@ -146,9 +185,26 @@ if __name__ == "__main__":
             "Demonstrates scenario D (TXT diag mismatch -> DEGRADED)."
         ),
     )
+    parser.add_argument(
+        "--migrate-to", type=int, default=None, dest="migrate_to",
+        help=(
+            "Phase 2B endpoint migration: after --migrate-delay, migrate advertised port to this port."
+        ),
+    )
+    parser.add_argument(
+        "--migrate-delay", type=float, default=10.0, dest="migrate_delay",
+        help="Seconds to wait before performing migration (default: 10.0)",
+    )
+    parser.add_argument(
+        "--migrate-mode", type=str, choices=["update", "re-register"], default="update", dest="migrate_mode",
+        help="Migration method: 'update' (in-place SRV update) or 're-register' (unregister + register). Default: update.",
+    )
     args = parser.parse_args()
     advertise(
         port=args.port,
         inject_port=args.inject_port,
         inject_diag=args.inject_diag,
+        migrate_to=args.migrate_to,
+        migrate_delay=args.migrate_delay,
+        migrate_mode=args.migrate_mode,
     )
