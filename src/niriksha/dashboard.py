@@ -1,0 +1,590 @@
+"""
+NIRIKSHA - DNS-SD Evidence-Based Verification Platform
+Phase 3A: Technical Demonstration Streamlit Dashboard
+
+"Discover. Examine. Verify."
+Real-data, read-only operational dashboard reading niriksha_events.jsonl.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import streamlit as st
+
+# Ensure src directory is in sys.path
+SRC_DIR = Path(__file__).resolve().parent.parent
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from niriksha.dashboard_data import (
+    compute_log_freshness,
+    compute_summary_counts,
+    derive_services_state,
+    extract_latency_timeseries,
+    extract_migrations,
+    extract_performance_metrics,
+    filter_events,
+    read_jsonl_events,
+)
+
+
+# ---------------------------------------------------------------------------
+# Streamlit App Configuration
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="NIRIKSHA — Discover. Examine. Verify.",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# Custom CSS for Professional Presentation
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    /* Theme-aware header and typography (works natively in Light and Dark themes) */
+    h1 {
+        font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif !important;
+        font-size: 2.3rem !important;
+        font-weight: 800 !important;
+        letter-spacing: -0.5px !important;
+        margin-bottom: 0px !important;
+        padding-bottom: 0px !important;
+        padding-top: 0px !important;
+    }
+    .niriksha-subtitle {
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: #0284C7 !important;
+        margin-top: -6px;
+        margin-bottom: 10px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+    }
+    @media (prefers-color-scheme: dark) {
+        .niriksha-subtitle {
+            color: #38BDF8 !important;
+        }
+    }
+    .status-badge {
+        display: inline-block;
+        padding: 3px 10px;
+        font-size: 0.85rem;
+        font-weight: 700;
+        border-radius: 6px;
+        letter-spacing: 0.5px;
+    }
+    .badge-verified {
+        background-color: rgba(34, 197, 94, 0.15);
+        color: #15803D;
+        border: 1px solid rgba(34, 197, 94, 0.4);
+    }
+    .badge-degraded {
+        background-color: rgba(234, 179, 8, 0.15);
+        color: #B45309;
+        border: 1px solid rgba(234, 179, 8, 0.4);
+    }
+    .badge-unreachable {
+        background-color: rgba(239, 68, 68, 0.15);
+        color: #B91C1C;
+        border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+    .badge-stale {
+        background-color: rgba(100, 116, 139, 0.15);
+        color: #475569;
+        border: 1px solid rgba(100, 116, 139, 0.4);
+    }
+    .badge-unknown {
+        background-color: rgba(148, 163, 184, 0.15);
+        color: #475569;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+    }
+    .flow-box {
+        background: var(--secondary-background-color, #F1F5F9);
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin-bottom: 12px;
+        font-family: Consolas, 'Courier New', monospace;
+        font-size: 0.95rem;
+        color: var(--text-color, #1E293B);
+    }
+    .flow-arrow {
+        color: #0284C7;
+        font-weight: bold;
+        margin: 0 8px;
+    }
+    .info-card {
+        background: rgba(2, 132, 199, 0.08);
+        border: 1px solid rgba(2, 132, 199, 0.3);
+        border-left: 4px solid #0284C7;
+        padding: 12px 16px;
+        border-radius: 6px;
+        font-size: 0.92rem;
+        color: var(--text-color, #0F172A);
+        margin-bottom: 14px;
+    }
+    /* Metric styling to prevent clipping or truncation of timestamp values */
+    [data-testid="stMetricValue"] {
+        font-size: 1.32rem !important;
+        line-height: 1.35 !important;
+        white-space: normal !important;
+        word-break: break-word !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.92rem !important;
+        font-weight: 600 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar Controls & Configuration
+# ---------------------------------------------------------------------------
+
+st.sidebar.markdown("### 🛡️ NIRIKSHA Control")
+st.sidebar.caption("Evidence-Based DNS-SD Verification Platform")
+
+# Log path selector
+default_log_path = Path("niriksha_events.jsonl")
+log_path_input = st.sidebar.text_input(
+    "Event Log Path",
+    value=str(default_log_path),
+    help="Path to niriksha_events.jsonl generated by the monitor process",
+)
+resolved_log_path = Path(log_path_input)
+
+# Check log existence
+log_exists = resolved_log_path.is_file()
+if log_exists:
+    log_size_kb = round(resolved_log_path.stat().st_size / 1024, 1)
+    st.sidebar.success(f"Log connected: {resolved_log_path.name} ({log_size_kb} KB)")
+else:
+    st.sidebar.warning(f"Log not found: {resolved_log_path.name}")
+
+# Manual & Safe Auto-refresh Controls
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔄 Refresh Settings")
+refresh_col1, refresh_col2 = st.sidebar.columns([1, 1])
+with refresh_col1:
+    if st.button("Refresh Now", use_container_width=True):
+        st.rerun()
+
+auto_refresh = st.sidebar.checkbox("Auto-refresh", value=False)
+refresh_interval = 5
+if auto_refresh:
+    refresh_interval = st.sidebar.slider(
+        "Interval (seconds)", min_value=2, max_value=30, value=5, step=1
+    )
+    st.sidebar.caption(f"Refreshing every {refresh_interval}s")
+
+# Filters for Timeline
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔍 Timeline Filters")
+filter_event_type = st.sidebar.selectbox(
+    "Event Type",
+    options=["ALL", "state_change", "endpoint_migration", "probe", "discovery"],
+    index=0,
+)
+filter_state = st.sidebar.selectbox(
+    "Service State",
+    options=["ALL", "VERIFIED", "DEGRADED", "UNREACHABLE", "STALE"],
+    index=0,
+)
+search_query = st.sidebar.text_input("Search Text", placeholder="instance, reason, port...")
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "**Architecture Note:** The dashboard operates strictly as a read-only telemetry viewer. "
+    "The monitor runs independently and logs verified events."
+)
+
+
+# ---------------------------------------------------------------------------
+# Main Header
+# ---------------------------------------------------------------------------
+
+col_title, col_meta = st.columns([1.7, 1.3])
+with col_title:
+    st.markdown("# 🛡️ NIRIKSHA")
+    st.markdown('<div class="niriksha-subtitle">Discover. Examine. Verify.</div>', unsafe_allow_html=True)
+    st.caption("Evidence-based verification platform for DNS-SD-discovered diagnostic services")
+
+# Read real data
+events = read_jsonl_events(resolved_log_path)
+services = derive_services_state(events)
+summary_counts = compute_summary_counts(services)
+perf_metrics = extract_performance_metrics(events)
+migrations = extract_migrations(events)
+freshness = compute_log_freshness(events)
+
+with col_meta:
+    if events and freshness["has_events"]:
+        delta_text = f"⚠️ STALE ({freshness['age_display']})" if freshness["is_stale"] else f"🟢 Active ({freshness['age_display']})"
+        delta_color = "inverse" if freshness["is_stale"] else "normal"
+        # Full formatted UTC timestamp with explicit UTC timezone indicator
+        formatted_utc = freshness["latest_timestamp_utc"].replace("T", " ").replace("Z", "") + " UTC"
+        st.metric(
+            label="Latest Recorded Event (UTC)",
+            value=formatted_utc,
+            delta=delta_text,
+            delta_color=delta_color,
+            help=freshness["freshness_message"],
+        )
+    else:
+        st.metric(label="Latest Recorded Event (UTC)", value="No Events", delta="Waiting for monitor")
+
+st.markdown("---")
+
+# Native, theme-aware warning banner when displaying historical data
+if events and freshness["is_stale"]:
+    st.warning(
+        f"**Historical Telemetry Notice:** The most recent event was recorded "
+        f"**{freshness['age_display']}** at `{freshness['latest_timestamp_utc']}`. "
+        "The monitor process is not currently streaming live events. Status labels below indicate the "
+        "**last observed historical verdict** and do not guarantee current live online health."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Empty Log / Missing Log Handling
+# ---------------------------------------------------------------------------
+
+if not events:
+    st.info(
+        "### ℹ️ No Event Data Available\n\n"
+        f"Could not load events from **`{resolved_log_path}`**.\n\n"
+        "**To produce real verification events:**\n"
+        "1. Launch a diagnostic service: `powershell -File scripts/run_service.ps1 -Port 8001`\n"
+        "2. Launch the zeroconf advertiser: `powershell -File scripts/run_advertiser.ps1 -Port 8001`\n"
+        "3. Launch the continuous monitor: `powershell -File scripts/run_monitor.ps1`\n\n"
+        "The monitor will automatically discover services via mDNS, perform deep HTTP verification, "
+        "and append real structured telemetry to `niriksha_events.jsonl`."
+    )
+    if auto_refresh:
+        time.sleep(refresh_interval)
+        st.rerun()
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Top KPI Metric Strip
+# ---------------------------------------------------------------------------
+
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1.metric("Discovered Services", summary_counts["total_discovered"], help="Unique service instances found in log history")
+m2.metric(
+    "Last VERIFIED",
+    summary_counts["verified"],
+    delta="Last Observed" if summary_counts["verified"] else None,
+    delta_color="off",
+    help="Services whose last recorded probe verdict was VERIFIED (historical verdict, not guaranteed live online right now)",
+)
+m3.metric(
+    "Last DEGRADED",
+    summary_counts["degraded"],
+    delta="Capability Mismatch" if summary_counts["degraded"] else None,
+    delta_color="inverse",
+    help="Services whose last recorded probe had capability mismatch or unhealthy status",
+)
+m4.metric(
+    "Last UNREACHABLE",
+    summary_counts["unreachable"],
+    delta="Endpoint Down" if summary_counts["unreachable"] else None,
+    delta_color="inverse",
+    help="Services whose endpoint was unreachable at the last recorded probe",
+)
+m5.metric(
+    "STALE (Withdrawn)",
+    summary_counts["stale"],
+    delta="mDNS Withdrawn" if summary_counts["stale"] else None,
+    delta_color="off",
+    help="Services whose mDNS advertisement was confirmed withdrawn",
+)
+m6.metric(
+    "Recorded Migrations",
+    len(migrations),
+    delta=f"{perf_metrics.probe_sample_count} Probes in Log",
+    help="Total endpoint migration events recorded in the log",
+)
+
+
+# ---------------------------------------------------------------------------
+# Main Tabs Layout
+# ---------------------------------------------------------------------------
+
+tab_services, tab_migration, tab_perf, tab_timeline = st.tabs([
+    "🔍 Discovered Services & Verification",
+    "🔄 DNS-SD Endpoint Migration",
+    "⚡ Performance & Latency Telemetry",
+    "📜 Filterable Event Timeline",
+])
+
+
+# ---------------------------------------------------------------------------
+# TAB 1: Discovered Services & Last Observed Service State
+# ---------------------------------------------------------------------------
+
+with tab_services:
+    st.subheader("Discovered Services — Last Observed Service State")
+    st.caption(
+        "Derived from recorded DNS-SD advertisements and last observed deep HTTP verification verdicts. "
+        "Note: Reflects historical status from the event log; does not assume the service is currently running."
+    )
+
+    for instance_name, svc in services.items():
+        st_state = svc["current_state"]
+        badge_class = {
+            "VERIFIED": "badge-verified",
+            "DEGRADED": "badge-degraded",
+            "UNREACHABLE": "badge-unreachable",
+            "STALE": "badge-stale",
+        }.get(st_state, "badge-unknown")
+
+        with st.container():
+            svc_col1, svc_col2, svc_col3 = st.columns([2, 1, 1])
+
+            with svc_col1:
+                st.markdown(
+                    f"**`{instance_name}`** &nbsp; "
+                    f'<span class="status-badge {badge_class}">Last: {st_state}</span>',
+                    unsafe_allow_html=True,
+                )
+                st.write(f"**Last Observed Verdict:** {svc['last_verdict']}")
+
+            with svc_col2:
+                endpoint_str = f"{svc['host']}:{svc['port']}" if svc['port'] else svc['host']
+                ip_str = f" ({svc['addresses'][0]})" if svc['addresses'] else ""
+                st.write(f"**Endpoint:** `{endpoint_str}{ip_str}`")
+                st.write(f"**TXT Advertised:** `diag={svc['txt_diag']}`")
+
+            with svc_col3:
+                h_lat = f"{svc['health_latency_ms']} ms" if svc['health_latency_ms'] is not None else "N/A"
+                v_lat = f"{svc['verification_latency_ms']} ms" if svc['verification_latency_ms'] is not None else "N/A"
+                st.write(f"**Last Probe Latency:** {h_lat}")
+                st.write(f"**Last Recorded Event:** `{svc['last_seen_utc']}`")
+
+            # Verification details expander
+            with st.expander(f"Detailed Diagnostics & Advertised TXT Properties — {instance_name}"):
+                det_c1, det_c2, det_c3 = st.columns(3)
+                with det_c1:
+                    st.write("**Advertised TXT Properties:**")
+                    st.json(svc["txt"] if svc["txt"] else {"notice": "No TXT properties found"})
+                with det_c2:
+                    st.write("**Probe Measurements:**")
+                    st.json({
+                        "http_status": svc["http_status"],
+                        "health_latency_ms": svc["health_latency_ms"],
+                        "verification_latency_ms": svc["verification_latency_ms"],
+                        "health_endpoint": svc["health_path"],
+                        "diagnose_endpoint": svc["run_path"],
+                    })
+                with det_c3:
+                    st.write("**Validation Breakdown:**")
+                    st.write(f"- TXT Fields Present: {'✅ Pass' if svc['txt_fields_ok'] else ('❌ Fail' if svc['txt_fields_ok'] is False else 'N/A')}")
+                    st.write(f"- /health JSON Healthy: {'✅ Pass' if svc['health_status_ok'] else ('❌ Fail' if svc['health_status_ok'] is False else 'N/A')}")
+                    st.write(f"- Capability Matches TXT: {'✅ Pass' if svc['diag_type_ok'] else ('❌ Fail' if svc['diag_type_ok'] is False else 'N/A')}")
+
+            st.markdown("---")
+
+
+# ---------------------------------------------------------------------------
+# TAB 2: DNS-SD Endpoint Migration & Recovery Tracking
+# ---------------------------------------------------------------------------
+
+with tab_migration:
+    st.subheader("DNS-SD Endpoint Migration & Autonomous Recovery")
+    st.caption("Tracks live service movements across ports/hosts with measured rediscovery and recovery latencies.")
+
+    if not migrations:
+        st.info(
+            "No endpoint migration events recorded in the current log.\n\n"
+            "To demonstrate migration, run `powershell -File scripts/run_migration_demo.ps1`."
+        )
+    else:
+        # Visual Sequence Flow
+        for idx, mig in enumerate(migrations, start=1):
+            st.markdown(f"#### Migration Event #{idx} — `{mig['instance_name']}`")
+            old_p = mig["old_port"]
+            new_p = mig["new_port"]
+
+            st.markdown(
+                f"""
+                <div class="flow-box">
+                    <span class="status-badge badge-verified">Port {old_p} (VERIFIED)</span>
+                    <span class="flow-arrow">➔</span>
+                    <span class="status-badge badge-unreachable">Port {old_p} (UNREACHABLE)</span>
+                    <span class="flow-arrow">➔</span>
+                    <span class="status-badge badge-degraded">Port {new_p} (REDISCOVERED)</span>
+                    <span class="flow-arrow">➔</span>
+                    <span class="status-badge badge-verified">Port {new_p} (VERIFIED)</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            redisc = f"{mig['rediscovery_latency_ms']:.2f} ms" if mig['rediscovery_latency_ms'] is not None else "N/A"
+            recov = f"{mig['recovery_latency_ms']:.2f} ms" if mig['recovery_latency_ms'] is not None else "N/A"
+            est_redisc = f"{mig['estimated_rediscovery_latency_ms']:.2f} ms" if mig.get('estimated_rediscovery_latency_ms') is not None else "N/A"
+            est_total = f"{mig['estimated_total_recovery_latency_ms']:.2f} ms" if mig.get('estimated_total_recovery_latency_ms') is not None else "N/A"
+
+            col_m1.metric("Rediscovery Latency", redisc, help="[Measured] Monotonic time from fault detection to mDNS update")
+            col_m2.metric("Recovery Latency", recov, help="[Measured] Monotonic time from fault detection to replacement verified")
+            col_m3.metric("Est. Total Recovery", est_total, help="[Estimated] Monotonic time from last known good verification to recovery")
+            col_m4.metric("Est. Rediscovery", est_redisc, help="[Estimated] Interval from last known good verification to rediscovery")
+
+            st.markdown(
+                f"**Migration Details:** Service moved from `{mig['old_host']}:{old_p}` to `{mig['new_host']}:{new_p}` "
+                f"at UTC `{mig['wall_clock_utc']}`. Reason: *{mig['reason']}*."
+            )
+            st.markdown("---")
+
+        # Methodology Explanation Card
+        st.markdown(
+            """
+            <div class="info-card">
+                <strong>Timing Methodology Distinctions:</strong><br>
+                • <strong>[Measured] Timing:</strong> High-precision monotonic duration between discrete observed events (e.g. from the moment UNREACHABLE was verified to the moment mDNS announced the new port).<br>
+                • <strong>[Estimated] Timing:</strong> Includes the polling interval gap between the last successful verification and the first failed probe, since faults occur asynchronously between poll cycles.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TAB 3: Performance Telemetry & Latencies
+# ---------------------------------------------------------------------------
+
+with tab_perf:
+    st.subheader("Performance & Latency Telemetry")
+    st.caption("Monotonic latency metrics recorded during deep verification and recovery cycles.")
+
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+
+    latest_h = f"{perf_metrics.latest_health_latency_ms} ms" if perf_metrics.latest_health_latency_ms is not None else "N/A"
+    avg_h = f"{perf_metrics.avg_health_latency_ms} ms" if perf_metrics.avg_health_latency_ms is not None else "N/A"
+    latest_v = f"{perf_metrics.latest_verification_latency_ms} ms" if perf_metrics.latest_verification_latency_ms is not None else "N/A"
+    avg_v = f"{perf_metrics.avg_verification_latency_ms} ms" if perf_metrics.avg_verification_latency_ms is not None else "N/A"
+    est_det = f"{perf_metrics.latest_detection_latency_ms} ms" if perf_metrics.latest_detection_latency_ms is not None else "N/A"
+
+    kpi1.metric("Health Latency (Latest)", latest_h, help="[Measured] Latency for GET /health probe")
+    kpi2.metric("Health Latency (Avg)", avg_h, help=f"[Measured] Mean across {perf_metrics.probe_sample_count} samples")
+    kpi3.metric("Verification Latency (Latest)", latest_v, help="[Measured] Latency for combined /health + /diagnose verification")
+    kpi4.metric("Verification Latency (Avg)", avg_v, help=f"[Measured] Mean across {perf_metrics.probe_sample_count} samples")
+    kpi5.metric("Est. Failure Detection", est_det, help="[Estimated] Interval between last VERIFIED and first failure detection")
+
+    st.markdown("---")
+    st.markdown("#### Real Latency Trends Over Time")
+
+    timeseries = extract_latency_timeseries(events)
+    if timeseries:
+        chart_data = []
+        for pt in timeseries:
+            chart_data.append({
+                "Timestamp (UTC)": pt["timestamp"],
+                "Health Latency (ms)": pt["health_latency_ms"],
+                "Verification Latency (ms)": pt["verification_latency_ms"],
+            })
+        st.line_chart(
+            data=chart_data,
+            x="Timestamp (UTC)",
+            y=["Health Latency (ms)", "Verification Latency (ms)"],
+            height=320,
+        )
+    else:
+        st.info("Insufficient latency timeseries data.")
+
+
+# ---------------------------------------------------------------------------
+# TAB 4: Filterable Event Timeline
+# ---------------------------------------------------------------------------
+
+with tab_timeline:
+    st.subheader("Filterable Event Timeline")
+    st.caption("Complete chronological record of mDNS discoveries, state transitions, migrations, and periodic probes.")
+
+    filtered = filter_events(
+        events=events,
+        event_type=filter_event_type,
+        state_filter=filter_state,
+        search_query=search_query,
+    )
+
+    st.write(f"Showing **{len(filtered)}** of **{len(events)}** total recorded events.")
+
+    if not filtered:
+        st.warning("No events match the selected filter criteria.")
+    else:
+        # Render a clean, fast table
+        table_rows = []
+        for evt in reversed(filtered):  # Most recent first
+            svc = evt.get("service") or {}
+            meas = evt.get("measurements") or {}
+            event_type = evt.get("event", "N/A")
+
+            # Determine transition text
+            if event_type == "state_change":
+                state_text = f"{evt.get('old_state', 'N/A')} ➔ {evt.get('new_state', 'N/A')}"
+            elif event_type == "probe":
+                state_text = f"{evt.get('state', 'N/A')} (steady)"
+            elif event_type == "endpoint_migration":
+                old_p = (evt.get("old_endpoint") or {}).get("port", "?")
+                new_p = (evt.get("new_endpoint") or {}).get("port", "?")
+                state_text = f"Port {old_p} ➔ Port {new_p}"
+            elif event_type == "discovery":
+                state_text = f"mDNS {evt.get('action', 'add')}"
+            else:
+                state_text = event_type
+
+            # Endpoint text
+            port = svc.get("port")
+            host = svc.get("host")
+            endpoint_str = f"{host}:{port}" if port and host else (str(port) if port else "N/A")
+
+            # Latency summary
+            h_lat = meas.get("health_latency_ms")
+            v_lat = meas.get("verification_latency_ms")
+            lat_str = f"{h_lat:.1f} / {v_lat:.1f} ms" if (h_lat and v_lat) else "N/A"
+
+            table_rows.append({
+                "Line": evt.get("_line_number", "-"),
+                "Timestamp (UTC)": evt.get("wall_clock_utc", "N/A"),
+                "Event Type": event_type,
+                "State Transition / Action": state_text,
+                "Endpoint": endpoint_str,
+                "Verdict / Reason": evt.get("reason", "N/A"),
+                "Latencies (H/V)": lat_str,
+            })
+
+        st.dataframe(
+            table_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("Raw JSON Inspector (Latest 10 Filtered Events)"):
+            for evt in filtered[-10:]:
+                st.json(evt)
+
+
+# ---------------------------------------------------------------------------
+# Periodic Auto-Refresh Execution
+# ---------------------------------------------------------------------------
+
+if auto_refresh:
+    time.sleep(refresh_interval)
+    st.rerun()
