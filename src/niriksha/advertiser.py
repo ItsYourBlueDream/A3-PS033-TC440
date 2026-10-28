@@ -1,11 +1,16 @@
 """
-NIRIKSHA — DNS-SD Evidence-Based Verification Platform
-Phase 1: DNS-SD Advertiser
+NIRIKSHA - DNS-SD Evidence-Based Verification Platform
+Phase 1 + 2A: DNS-SD Advertiser
 
 Registers the NIRIKSHA diagnostic service via mDNS/DNS-SD using python-zeroconf.
 Service type : _niriksha._tcp.local.
 Default port : 8001
 
+Phase 2A fault-injection CLI flags (do NOT affect Phase 1 defaults):
+  --inject-port PORT   Advertise a wrong SRV port (service still listens on 8001).
+  --inject-diag VALUE  Advertise a wrong TXT diag value (e.g. "http" instead of "dns").
+
+These flags are for controlled failure demonstrations only.
 Selects an active, non-loopback IPv4 address automatically from the OS.
 """
 
@@ -28,26 +33,34 @@ DEFAULT_PORT = 8001
 def _get_local_ipv4() -> str:
     """
     Return the preferred outbound IPv4 address by attempting a UDP connect to
-    a public address (no packet is actually sent).  Falls back to socket.gethostbyname.
+    a public address (no packet is actually sent). Falls back to gethostbyname.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))          # no real traffic — just routing table lookup
+            s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
     except OSError:
         return socket.gethostbyname(socket.gethostname())
 
 
-def _build_service_info(port: int, ip: str) -> ServiceInfo:
-    """Build a zeroconf ServiceInfo record for the diagnostic service."""
+def _build_service_info(
+    port: int,
+    ip: str,
+    inject_diag: str | None = None,
+) -> ServiceInfo:
+    """
+    Build a zeroconf ServiceInfo record.
+
+    inject_diag: if set, override the TXT 'diag' field with this value.
+    """
     hostname = socket.gethostname()
     full_name = f"{INSTANCE_NAME}.{SERVICE_TYPE}"
 
     properties = {
-        "diag": "dns",
+        "diag":    inject_diag if inject_diag is not None else "dns_lookup",
         "txtvers": "1",
-        "health": "/health",
-        "run": "/diagnose",
+        "health":  "/health",
+        "run":     "/diagnose",
     }
 
     return ServiceInfo(
@@ -60,20 +73,36 @@ def _build_service_info(port: int, ip: str) -> ServiceInfo:
     )
 
 
-def advertise(port: int = DEFAULT_PORT) -> None:
-    """Register the service and block until SIGINT / SIGTERM."""
+def advertise(
+    port: int = DEFAULT_PORT,
+    inject_port: int | None = None,
+    inject_diag: str | None = None,
+) -> None:
+    """
+    Register the service and block until SIGINT / SIGTERM.
+
+    inject_port: advertise this port instead of the real one (fault scenario B/C).
+    inject_diag: advertise this TXT diag value instead of 'dns' (fault scenario D).
+    """
     ip = _get_local_ipv4()
-    info = _build_service_info(port, ip)
+    advertised_port = inject_port if inject_port is not None else port
+    info = _build_service_info(advertised_port, ip, inject_diag=inject_diag)
 
     zc = Zeroconf()
     zc.register_service(info)
 
-    print(f"[ADVERTISER] Service registered:")
-    print(f"  Name    : {info.name}")
-    print(f"  Type    : {SERVICE_TYPE}")
-    print(f"  Address : {ip}")
-    print(f"  Port    : {port}")
-    print(f"  TXT     : {dict(info.properties)}")
+    print("[ADVERTISER] Service registered:")
+    print(f"  Name           : {info.name}")
+    print(f"  Type           : {SERVICE_TYPE}")
+    print(f"  Address        : {ip}")
+    print(f"  Advertised port: {advertised_port}", end="")
+    if inject_port is not None:
+        print(f"  [INJECTED - real service on {port}]", end="")
+    print()
+    print(f"  TXT            : {dict(info.properties)}", end="")
+    if inject_diag is not None:
+        print(f"  [INJECTED diag='{inject_diag}']", end="")
+    print()
     print("[ADVERTISER] Advertising ... Press Ctrl-C to stop.\n", flush=True)
 
     stop_flag = [False]
@@ -88,17 +117,38 @@ def advertise(port: int = DEFAULT_PORT) -> None:
         while not stop_flag[0]:
             time.sleep(0.5)
     finally:
-        print("\n[ADVERTISER] Unregistering service …", flush=True)
+        print("\n[ADVERTISER] Unregistering service ...", flush=True)
         zc.unregister_service(info)
         zc.close()
         print("[ADVERTISER] Done.", flush=True)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NIRIKSHA DNS-SD Advertiser")
+    parser = argparse.ArgumentParser(
+        description="NIRIKSHA DNS-SD Advertiser (Phase 1 + 2A)"
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT,
-        help=f"Port the diagnostic HTTP service is listening on (default: {DEFAULT_PORT})"
+        help=f"Port the real HTTP service listens on (default: {DEFAULT_PORT})"
+    )
+    parser.add_argument(
+        "--inject-port", type=int, default=None, dest="inject_port",
+        help=(
+            "Phase 2A fault injection: advertise this WRONG port in the SRV record. "
+            "The real service continues on --port. "
+            "Demonstrates scenario C (wrong advertised port -> UNREACHABLE)."
+        ),
+    )
+    parser.add_argument(
+        "--inject-diag", type=str, default=None, dest="inject_diag",
+        help=(
+            "Phase 2A fault injection: advertise this WRONG TXT diag value. "
+            "Demonstrates scenario D (TXT diag mismatch -> DEGRADED)."
+        ),
     )
     args = parser.parse_args()
-    advertise(port=args.port)
+    advertise(
+        port=args.port,
+        inject_port=args.inject_port,
+        inject_diag=args.inject_diag,
+    )
