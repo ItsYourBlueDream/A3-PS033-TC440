@@ -27,6 +27,7 @@ import signal
 import socket
 import sys
 import time
+from pathlib import Path
 
 from zeroconf import ServiceInfo, Zeroconf
 
@@ -86,13 +87,15 @@ def advertise(
     migrate_to: int | None = None,
     migrate_delay: float = 10.0,
     migrate_mode: str = "update",
+    migrate_trigger_file: str | None = None,
 ) -> None:
     """
     Register the service and block until SIGINT / SIGTERM.
 
     inject_port: advertise this port instead of the real one (fault scenario B/C).
     inject_diag: advertise this TXT diag value instead of 'dns' (fault scenario D).
-    migrate_to:  after migrate_delay, migrate advertised port to this value (Phase 2B).
+    migrate_to:  after migrate_delay or trigger file, migrate advertised port to this value (Phase 2B).
+    migrate_trigger_file: if provided, migrate when this file exists on disk.
     """
     ip = _get_local_ipv4()
     advertised_port = inject_port if inject_port is not None else port
@@ -114,11 +117,18 @@ def advertise(
         print(f"  [INJECTED diag='{inject_diag}']", end="")
     print()
     if migrate_to is not None:
-        print(
-            f"  [MIGRATION SCHEDULED] Will migrate to port {migrate_to} "
-            f"in {migrate_delay}s (mode: {migrate_mode})",
-            flush=True,
-        )
+        if migrate_trigger_file:
+            print(
+                f"  [MIGRATION CONFIGURED] Will migrate to port {migrate_to} "
+                f"when trigger file exists: {migrate_trigger_file} (mode: {migrate_mode})",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [MIGRATION SCHEDULED] Will migrate to port {migrate_to} "
+                f"in {migrate_delay}s (mode: {migrate_mode})",
+                flush=True,
+            )
     print("[ADVERTISER] Advertising ... Press Ctrl-C to stop.\n", flush=True)
 
     stop_flag = [False]
@@ -136,7 +146,14 @@ def advertise(
         while not stop_flag[0]:
             time.sleep(0.5)
             if migrate_to is not None and not migrated:
-                if (time.monotonic() - start_mono) >= migrate_delay:
+                should_migrate = False
+                if migrate_trigger_file:
+                    if Path(migrate_trigger_file).is_file():
+                        should_migrate = True
+                elif (time.monotonic() - start_mono) >= migrate_delay:
+                    should_migrate = True
+
+                if should_migrate:
                     print(
                         f"\n[ADVERTISER] Migrating service to port {migrate_to} "
                         f"(mode: {migrate_mode}) ...",
@@ -188,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migrate-to", type=int, default=None, dest="migrate_to",
         help=(
-            "Phase 2B endpoint migration: after --migrate-delay, migrate advertised port to this port."
+            "Phase 2B endpoint migration: after --migrate-delay or trigger file, migrate advertised port to this port."
         ),
     )
     parser.add_argument(
@@ -199,6 +216,10 @@ if __name__ == "__main__":
         "--migrate-mode", type=str, choices=["update", "re-register"], default="update", dest="migrate_mode",
         help="Migration method: 'update' (in-place SRV update) or 're-register' (unregister + register). Default: update.",
     )
+    parser.add_argument(
+        "--migrate-trigger-file", type=str, default=None, dest="migrate_trigger_file",
+        help="Path to trigger file. When present, perform migration to --migrate-to immediately.",
+    )
     args = parser.parse_args()
     advertise(
         port=args.port,
@@ -207,4 +228,5 @@ if __name__ == "__main__":
         migrate_to=args.migrate_to,
         migrate_delay=args.migrate_delay,
         migrate_mode=args.migrate_mode,
+        migrate_trigger_file=args.migrate_trigger_file,
     )

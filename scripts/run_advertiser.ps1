@@ -6,7 +6,8 @@ param(
     [string]$InjectDiag = "",
     [int]$MigrateTo = 0,
     [double]$MigrateDelay = 10.0,
-    [string]$MigrateMode = "update"
+    [string]$MigrateMode = "update",
+    [string]$MigrateTriggerFile = ""
 )
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -18,6 +19,9 @@ Write-Host "[ADVERTISER] PYTHONPATH = $env:PYTHONPATH" -ForegroundColor DarkGray
 $argsList = @("-m", "niriksha.advertiser", "--port", "$Port")
 if ($InjectPort -gt 0) { $argsList += @("--inject-port", "$InjectPort") }
 if ($InjectDiag -ne "") { $argsList += @("--inject-diag", "$InjectDiag") }
-if ($MigrateTo -gt 0) { $argsList += @("--migrate-to", "$MigrateTo", "--migrate-delay", "$MigrateDelay", "--migrate-mode", "$MigrateMode") }
+if ($MigrateTo -gt 0) {
+    $argsList += @("--migrate-to", "$MigrateTo", "--migrate-delay", "$MigrateDelay", "--migrate-mode", "$MigrateMode")
+    if ($MigrateTriggerFile -ne "") { $argsList += @("--migrate-trigger-file", "$MigrateTriggerFile") }
+}
 
 & "$root\.venv\Scripts\python.exe" $argsList
