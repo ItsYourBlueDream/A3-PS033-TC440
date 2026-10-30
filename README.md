@@ -5,7 +5,17 @@
 **Team:** DARSHAN 2.0  
 **Team Code:** `A3-PS033-TC440`  
 **Latest Automated Test Baseline:** `51 / 51 PASSED` (100% passing across unit, integration, migration, and dashboard test suites)  
-**Latest Pushed Commit Baseline:** `87e2435`  
+**Phase 3A Dashboard Baseline Commit:** `87e2435`  
+
+---
+
+## Working Demonstration - Implemented Prototype
+
+[Watch the NIRIKSHA Working Demo](https://youtu.be/ceSasOSAdsU)
+
+[Technical details and reproduction guide](WORKING_DEMO.md)
+
+This video shows a recorded local experiment, not a hosted live application.
 
 ---
 
@@ -477,5 +487,7 @@ In accordance with hackathon guidelines, NIRIKSHA states its technical boundarie
 * **Official Team Orientation Video:** [https://youtu.be/j814kD0HllM](https://youtu.be/j814kD0HllM)
 * **Code Repository:** `https://github.com/aiori-hackathon/A3-PS033-TC440.git`
 * **Baseline Commit:** `87e2435`
+
+
 
 
