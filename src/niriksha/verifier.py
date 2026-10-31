@@ -97,14 +97,35 @@ def _check_diag_capability(
     match = (observed_diag == advertised_diag) or (
         advertised_diag == "dns" and observed_diag == "dns_lookup"
     )
-    if match:
-        reason = f"TXT diag='{advertised_diag}' matches /diagnose diagnostic='{observed_diag}'"
-    else:
+    if not match:
         reason = (
             f"Capability mismatch: TXT advertises diag='{advertised_diag}' "
             f"but /diagnose reports diagnostic='{observed_diag}'"
         )
-    return match, body, reason
+        return False, body, reason
+
+    # Diagnostic type matches.  Now verify the operation actually succeeded.
+    # A diagnostic that reports success=false (e.g. DNS timeout) must not
+    # be accepted as VERIFIED — the *capability* is present but the
+    # *operation* failed, so the service is DEGRADED.  A missing 'success'
+    # field is treated the same way: never assume an unverified operation
+    # succeeded.
+    diag_success = body.get("success")
+    if diag_success is None:
+        return False, body, (
+            f"TXT diag='{advertised_diag}' matches /diagnose diagnostic='{observed_diag}', "
+            f"but 'success' field is missing; cannot confirm operational status"
+        )
+    if diag_success is not True:
+        return False, body, (
+            f"TXT diag='{advertised_diag}' matches /diagnose diagnostic='{observed_diag}', "
+            f"but diagnostic operation reported success={diag_success}"
+        )
+
+    return True, body, (
+        f"TXT diag='{advertised_diag}' matches /diagnose diagnostic='{observed_diag}', "
+        f"success=True"
+    )
 
 
 # ---------------------------------------------------------------------------

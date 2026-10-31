@@ -97,7 +97,7 @@ class TestVerifiedState:
         """MOCK: Verification result must report a non-negative health latency."""
         record = _make_record(diag="dns_lookup")
         health_body = {"status": "healthy"}
-        diagnose_body = {"diagnostic": "dns_lookup"}
+        diagnose_body = {"diagnostic": "dns_lookup", "success": True}
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -226,7 +226,7 @@ class TestDegradedState:
         """
         record = _make_record(diag="http")   # wrong advertised capability
         health_body = {"status": "healthy"}
-        diagnose_body = {"diagnostic": "dns_lookup"}   # real observed behaviour
+        diagnose_body = {"diagnostic": "dns_lookup", "success": True}   # real observed behaviour
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -298,7 +298,7 @@ class TestDegradedState:
         del record.txt["run"]   # remove required key
 
         health_body = {"status": "healthy"}
-        diagnose_body = {"diagnostic": "dns_lookup"}
+        diagnose_body = {"diagnostic": "dns_lookup", "success": True}
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -507,3 +507,124 @@ class TestMonitorFSMAndTiming:
         assert len(stale_events) == 1
         assert stale_events[0]["old_state"] == "VERIFIED"
         assert stale_events[0]["new_state"] == "STALE"
+
+
+# ---------------------------------------------------------------------------
+# Scenario E: Diagnostic success field validation (defect fix regression)
+# ---------------------------------------------------------------------------
+
+class TestDiagSuccessField:
+    """
+    MOCK TESTS: Regression tests for the diagnostic 'success' field check.
+
+    The real /diagnose endpoint returns {"success": true} on a successful
+    DNS lookup and {"success": false} on failure. The verifier must treat
+    success=false and missing-success as DEGRADED, even when the diagnostic
+    type matches the TXT advertisement.
+    """
+
+    def test_diagnose_success_true_is_verified(self):
+        """
+        MOCK: /diagnose returns diagnostic='dns_lookup' with success=True.
+        Expected state: VERIFIED — type matches AND operation succeeded.
+        """
+        record = _make_record(diag="dns_lookup")
+        health_body = {"status": "healthy"}
+        diagnose_body = {"diagnostic": "dns_lookup", "success": True}
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value.__enter__.return_value = mock_client
+            mock_client.get.side_effect = [
+                _make_http_response(200, health_body),
+                _make_http_response(200, diagnose_body),
+            ]
+            result = verifier_mod.verify_once(record, http_timeout=5.0)
+
+        assert result.state == ServiceState.VERIFIED
+        assert result.diag_type_ok is True
+        assert "success=True" in result.reason
+
+    def test_diagnose_success_false_is_degraded(self):
+        """
+        MOCK: /diagnose returns diagnostic='dns_lookup' with success=False.
+        This simulates a real DNS lookup failure (e.g. no network).
+        Expected state: DEGRADED — type matches but operation failed.
+        """
+        record = _make_record(diag="dns_lookup")
+        health_body = {"status": "healthy"}
+        diagnose_body = {
+            "diagnostic": "dns_lookup",
+            "success": False,
+            "error": "The DNS operation timed out",
+        }
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value.__enter__.return_value = mock_client
+            mock_client.get.side_effect = [
+                _make_http_response(200, health_body),
+                _make_http_response(200, diagnose_body),
+            ]
+            result = verifier_mod.verify_once(record, http_timeout=5.0)
+
+        assert result.state == ServiceState.DEGRADED, (
+            f"Expected DEGRADED but got {result.state}: {result.reason}"
+        )
+        assert result.diag_type_ok is False
+        assert result.diagnose_body is not None
+        assert result.diagnose_body["success"] is False
+        assert "success=False" in result.reason
+
+    def test_diagnose_success_missing_is_degraded(self):
+        """
+        MOCK: /diagnose returns diagnostic='dns_lookup' but omits 'success'.
+        A missing success field cannot confirm operational status.
+        Expected state: DEGRADED.
+        """
+        record = _make_record(diag="dns_lookup")
+        health_body = {"status": "healthy"}
+        diagnose_body = {"diagnostic": "dns_lookup"}  # no 'success' field
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value.__enter__.return_value = mock_client
+            mock_client.get.side_effect = [
+                _make_http_response(200, health_body),
+                _make_http_response(200, diagnose_body),
+            ]
+            result = verifier_mod.verify_once(record, http_timeout=5.0)
+
+        assert result.state == ServiceState.DEGRADED, (
+            f"Expected DEGRADED but got {result.state}: {result.reason}"
+        )
+        assert result.diag_type_ok is False
+        assert "success" in result.reason.lower()
+        assert "missing" in result.reason.lower()
+
+    def test_diagnose_success_false_with_phase1_diag_dns(self):
+        """
+        MOCK: Advertised TXT diag='dns' (Phase 1 alias), /diagnose returns
+        diagnostic='dns_lookup' with success=False.
+        Expected state: DEGRADED — alias match alone is not enough.
+        """
+        record = _make_record(diag="dns")
+        health_body = {"status": "healthy"}
+        diagnose_body = {
+            "diagnostic": "dns_lookup",
+            "success": False,
+            "error": "DNS resolution failed",
+        }
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value.__enter__.return_value = mock_client
+            mock_client.get.side_effect = [
+                _make_http_response(200, health_body),
+                _make_http_response(200, diagnose_body),
+            ]
+            result = verifier_mod.verify_once(record, http_timeout=5.0)
+
+        assert result.state == ServiceState.DEGRADED
+        assert result.diag_type_ok is False
+        assert "success=False" in result.reason
