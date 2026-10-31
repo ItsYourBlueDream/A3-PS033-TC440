@@ -4,7 +4,7 @@
 **AIORI-3 Hackathon — Problem Statement PS-033**  
 **Team:** DARSHAN 2.0  
 **Team Code:** `A3-PS033-TC440`  
-**Latest Automated Test Baseline:** `51 / 51 PASSED` (100% passing across unit, integration, migration, and dashboard test suites)  
+**Latest Automated Test Baseline:** `55 / 55 PASSED` (100% passing across unit, integration, migration, and dashboard test suites)  
 **Phase 3A Dashboard Baseline Commit:** `87e2435`  
 
 ---
@@ -183,7 +183,7 @@ D:\aiori\A3-PS033-TC440
 │   ├── dashboard_data.py              # Decoupled data parsing, analytics, and freshness engine
 │   └── dashboard.py                   # Streamlit multi-tab evidence dashboard UI
 │
-└── tests/                             # Comprehensive automated test suite (51 tests)
+└── tests/                             # Comprehensive automated test suite (55 tests)
     ├── __init__.py
     ├── test_verifier.py               # Unit tests for verifier, TXT validation, and FSM timing
     ├── test_e2e.py                    # Integration tests against live uvicorn servers
@@ -451,15 +451,15 @@ Execute from the project root:
 .\.venv\Scripts\pytest -v --tb=short
 ```
 
-### Verified Test Breakdown (51 / 51 Passing)
+### Verified Test Breakdown (55 / 55 Passing)
 
 | Test Module | Tests | Scope & Assertions Tested |
 |:---|:---:|:---|
-| `tests/test_verifier.py` | **25** | Unit tests for `ServiceState` enum, required TXT keys, JSON parsing, capability cross-checking, HTTP timeout handling, FSM transitions, and monotonic clock accuracy. |
+| `tests/test_verifier.py` | **29** | Unit tests for `ServiceState` enum, required TXT keys, JSON parsing, capability cross-checking, HTTP timeout handling, FSM transitions, and monotonic clock accuracy. |
 | `tests/test_e2e.py` | **7** | Live integration tests spawning real FastAPI/Uvicorn processes: normal verification (`VERIFIED`), stopped service (`UNREACHABLE`), wrong advertised port (`UNREACHABLE`), and capability mismatch (`DEGRADED`). |
 | `tests/test_migration.py` | **6** | FSM migration event parsing, lifecycle transitions (`UNREACHABLE -> VERIFIED`), degraded capability on migrated targets, and full live server migration and recovery. |
 | `tests/test_dashboard.py` | **13** | JSONL parsing, service state derivation, summary KPI computation, performance metric aggregations, migration extraction, search/filter logic, log freshness calculation, and backwards-compatibility with real logs. |
-| **Total** | **51** | **All 51 tests passing consistently.** |
+| **Total** | **55** | **All 55 tests passing consistently.** |
 
 ---
 
@@ -487,6 +487,7 @@ In accordance with hackathon guidelines, NIRIKSHA states its technical boundarie
 * **Official Team Orientation Video:** [https://youtu.be/j814kD0HllM](https://youtu.be/j814kD0HllM)
 * **Code Repository:** `https://github.com/aiori-hackathon/A3-PS033-TC440.git`
 * **Baseline Commit:** `87e2435`
+
 
 
 
